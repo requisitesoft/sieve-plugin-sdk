@@ -63,13 +63,19 @@ func (p myPlugin) Execute(ctx context.Context, req *plugin.ExecuteRequest) (*plu
 }
 ```
 
-### Non-terminal plugins (passing output to the next stage)
+### Plugin output — `Output` vs `ResultJson`
 
-If your plugin is not the last stage, set `Output` instead of `ResultJson` so the host forwards
-the value to the next stage:
+Plugins do not need to know their position in the pipeline. Follow one simple rule:
+
+- **Always set `Output`** with the typed result your plugin produces. The host uses this to pass
+  data to the next stage, or renders it as a standard stats/log table when your plugin is last.
+- **Optionally also set `ResultJson`** if your plugin has a dedicated frontend component that needs
+  a custom JSON shape. When set, `ResultJson` takes precedence over `Output` for terminal rendering,
+  but `Output` is still used when your plugin is not the last stage.
 
 ```go
 return &plugin.ExecuteResponse{
+    // Always set — lets this plugin be used at any position in the pipeline.
     Output: &plugin.PipelineValue{
         Value: &plugin.PipelineValue_Stats{
             Stats: &plugin.StatsResult{
@@ -78,12 +84,14 @@ return &plugin.ExecuteResponse{
             },
         },
     },
+    // Optional — only needed when your frontend component expects a custom shape.
+    ResultJson: customJSON,
 }, nil
 ```
 
-A plugin that sets `Output` and is the last stage will have its output rendered by the host as a
-stats table. A plugin that sets `ResultJson` and is a non-terminal stage will cause a pipeline
-error — the host requires `Output` from all non-terminal plugin stages.
+If a plugin sets only `ResultJson` and is used as a non-terminal stage, the host returns an error
+to the user ("this plugin cannot be used as an intermediate stage"). The plugin author does not need
+to handle this case.
 
 ---
 
