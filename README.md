@@ -11,48 +11,81 @@ They are compiled with `GOOS=wasip1 GOARCH=wasm` and loaded at runtime by the Si
 go get github.com/requisitesoft/sieve-plugin-sdk
 ```
 
-## Quick start
+## How pipelining works
+
+Sieve's pipe syntax chains stages left to right. Each stage is either a built-in stats expression
+or a plugin command:
+
+```
+<lucene filter> | <stage 1> | <stage 2> | ...
+```
+
+The host runs stages in order. Built-in stats expressions (e.g. `count() BY host`) execute a
+DuckDB query and pass the result table to the next stage as a typed `PipelineValue`. Plugin stages
+receive that value via `req.GetInput()` and can use it directly — no redundant query needed.
+
+### Example: visualization plugin
+
+```
+errors | count() BY host | chart pie
+```
+
+1. `errors` — Lucene filter passed to all stages as context
+2. `count() BY host` — built-in stats stage; produces a `StatsResult` pipeline value
+3. `chart pie` — plugin stage; receives the stats table via `req.GetInput()`, renders a chart
+
+The `chart` plugin reads `req.GetInput().GetStats()` instead of running its own query:
 
 ```go
-//go:build wasip1
+func (p myPlugin) Execute(ctx context.Context, req *plugin.ExecuteRequest) (*plugin.ExecuteResponse, error) {
+    if input := req.GetInput(); input != nil {
+        s := input.GetStats()
+        if s == nil {
+            return &plugin.ExecuteResponse{Error: "expected a stats result from the previous stage"}, nil
+        }
+        // s.GetColumns(), s.GetRowsJson(), s.GetGroupBy(), etc.
+        return renderChart(s), nil
+    }
 
-package main
-
-import (
-    "context"
-
-    "github.com/requisitesoft/sieve-plugin-sdk/plugin"
-)
-
-func main() {}
-
-func init() { plugin.RegisterPipePlugin(myPlugin{}) }
-
-type myPlugin struct{}
-
-func (myPlugin) GetInfo(_ context.Context, _ *plugin.InfoRequest) (*plugin.InfoResponse, error) {
-    return &plugin.InfoResponse{
-        Name:     "my-command",
-        Version:  "1.0.0",
-        Commands: []string{"mycommand"},
-    }, nil
-}
-
-func (myPlugin) Execute(ctx context.Context, req *plugin.ExecuteRequest) (*plugin.ExecuteResponse, error) {
+    // Fallback: plugin is stage 1, no pipeline input — run our own query.
     host := plugin.NewPipeHost()
     resp, err := host.ExecuteStats(ctx, &plugin.StatsExecuteRequest{
         StatsExpr:    req.GetArgs(),
         ParquetPaths: req.GetParquetPaths(),
         WhereClause:  req.GetWhereClause(),
-        Page:         req.GetPage(),
-        PageSize:     req.GetPageSize(),
+        Page:         1,
+        PageSize:     1000,
     })
     if err != nil {
         return &plugin.ExecuteResponse{Error: err.Error()}, nil
     }
-    return &plugin.ExecuteResponse{ResultJson: resp.GetRawJson()}, nil
+    return renderChartFromResponse(resp), nil
 }
 ```
+
+### Non-terminal plugins (passing output to the next stage)
+
+If your plugin is not the last stage, set `Output` instead of `ResultJson` so the host forwards
+the value to the next stage:
+
+```go
+return &plugin.ExecuteResponse{
+    Output: &plugin.PipelineValue{
+        Value: &plugin.PipelineValue_Stats{
+            Stats: &plugin.StatsResult{
+                Columns:  columns,
+                RowsJson: rowsJSON,
+            },
+        },
+    },
+}, nil
+```
+
+A plugin that sets `Output` and is the last stage will have its output rendered by the host as a
+stats table. A plugin that sets `ResultJson` and is a non-terminal stage will cause a pipeline
+error — the host requires `Output` from all non-terminal plugin stages.
+
+---
 
 ## Building
 
@@ -108,26 +141,61 @@ Called when a query contains one of your registered pipe keywords.
 |---|---|---|
 | `GetCommand()` | `string` | The matched keyword (useful if you registered multiple) |
 | `GetArgs()` | `string` | Everything after the keyword on the same pipe segment |
-| `GetRest()` | `string` | Remaining pipe segments after yours (rarely needed) |
 | `GetParquetPaths()` | `[]string` | Data files in scope for the current query |
 | `GetWhereClause()` | `string` | Lucene filter from the search bar (before the first pipe) |
 | `GetStartTime()` | `string` | ISO 8601 start of the selected time range |
 | `GetEndTime()` | `string` | ISO 8601 end of the selected time range |
 | `GetPage()` | `int32` | Requested page number (1-based) |
 | `GetPageSize()` | `int32` | Requested page size |
+| `GetInput()` | `*PipelineValue` | Output of the previous stage, or `nil` if this is stage 1 |
 
 **Returns** `*ExecuteResponse`:
 
 | Field | Type | Description |
 |---|---|---|
-| `ResultJson` | `[]byte` | JSON payload passed to the frontend component for rendering |
-| `Error` | `string` | Non-empty string aborts execution and shows an error to the user |
+| `ResultJson` | `[]byte` | JSON rendered by the frontend component (terminal stage) |
+| `Output` | `*PipelineValue` | Typed value passed to the next stage (non-terminal stage) |
+| `Error` | `string` | Non-empty aborts the pipeline and shows an error to the user |
+
+Set either `ResultJson` or `Output`, not both. Non-terminal stages must set `Output`.
+
+---
+
+### `PipelineValue`
+
+The typed value that flows between pipe stages.
+
+```go
+// Wrap a stats result:
+&plugin.PipelineValue{Value: &plugin.PipelineValue_Stats{Stats: statsResult}}
+
+// Wrap a log result:
+&plugin.PipelineValue{Value: &plugin.PipelineValue_Logs{Logs: logResult}}
+```
+
+**`StatsResult`** fields (via getters):
+
+| Getter | Type | Description |
+|---|---|---|
+| `GetColumns()` | `[]string` | Column names in result order |
+| `GetGroupBy()` | `[]string` | Which columns are GROUP BY keys |
+| `GetRowsJson()` | `[]string` | Each row as a JSON array, e.g. `["host1", 42]` |
+| `GetIsAggregate()` | `bool` | True when the expression produced aggregated results |
+| `GetTotalCount()` | `int32` | Total rows across all pages |
+
+**`LogResult`** fields (via getters):
+
+| Getter | Type | Description |
+|---|---|---|
+| `GetEntriesJson()` | `[]string` | Each log entry as a JSON object |
+| `GetTotalCount()` | `int32` | Total matching entries across all pages |
 
 ---
 
 ### `PipeHost` interface
 
-Obtained by calling `NewPipeHost()`. Lets your plugin call back into the Sieve host to run queries.
+Obtained by calling `NewPipeHost()`. Use this when your plugin is stage 1 and needs to run its
+own query, or when it needs data from a source other than the pipeline input.
 
 ```go
 type PipeHost interface {
@@ -136,21 +204,15 @@ type PipeHost interface {
 }
 ```
 
-#### `NewPipeHost() PipeHost`
-
-Returns a handle to the host. Call this inside `Execute` when you need to run a query.
-
 #### `ExecuteStats`
-
-Run a stats aggregation (equivalent to a `| <expr>` query in the search bar).
 
 **Request** `*StatsExecuteRequest`:
 
 | Field | Type | Description |
 |---|---|---|
-| `StatsExpr` | `string` | Aggregation expression, e.g. `"count() BY host"` or `"sum(bytes)"` |
-| `ParquetPaths` | `[]string` | Pass through from `ExecuteRequest.GetParquetPaths()` |
-| `WhereClause` | `string` | Pass through from `ExecuteRequest.GetWhereClause()` |
+| `StatsExpr` | `string` | Aggregation expression, e.g. `"count() BY host"` |
+| `ParquetPaths` | `[]string` | Pass through from `req.GetParquetPaths()` |
+| `WhereClause` | `string` | Pass through from `req.GetWhereClause()` |
 | `Page` | `int32` | Page number (1-based) |
 | `PageSize` | `int32` | Rows per page |
 
@@ -158,23 +220,21 @@ Run a stats aggregation (equivalent to a `| <expr>` query in the search bar).
 
 | Getter | Type | Description |
 |---|---|---|
-| `GetColumns()` | `[]string` | Column names in result order |
-| `GetGroupBy()` | `[]string` | Which columns are GROUP BY keys |
-| `GetRowsJson()` | `[]string` | Each row serialized as a JSON array, e.g. `["host1", 42]` |
-| `GetIsAggregate()` | `bool` | True when the expression produced aggregated results |
-| `GetTotalCount()` | `int32` | Total matching rows across all pages |
-| `GetError()` | `string` | Non-empty if the host query failed |
+| `GetColumns()` | `[]string` | Column names |
+| `GetGroupBy()` | `[]string` | GROUP BY column names |
+| `GetRowsJson()` | `[]string` | Each row as a JSON array |
+| `GetIsAggregate()` | `bool` | True for aggregated results |
+| `GetTotalCount()` | `int32` | Total rows across all pages |
+| `GetError()` | `string` | Non-empty if the query failed |
 
 #### `ExecuteSearch`
-
-Retrieve raw log entries matching a filter.
 
 **Request** `*SearchExecuteRequest`:
 
 | Field | Type | Description |
 |---|---|---|
-| `ParquetPaths` | `[]string` | Pass through from `ExecuteRequest.GetParquetPaths()` |
-| `WhereClause` | `string` | Pass through from `ExecuteRequest.GetWhereClause()` |
+| `ParquetPaths` | `[]string` | Pass through from `req.GetParquetPaths()` |
+| `WhereClause` | `string` | Pass through from `req.GetWhereClause()` |
 | `Page` | `int32` | Page number (1-based) |
 | `PageSize` | `int32` | Rows per page |
 
@@ -182,9 +242,9 @@ Retrieve raw log entries matching a filter.
 
 | Getter | Type | Description |
 |---|---|---|
-| `GetEntriesJson()` | `[]string` | Each log entry serialized as a JSON object |
-| `GetTotalCount()` | `int32` | Total matching entries across all pages |
-| `GetError()` | `string` | Non-empty if the host query failed |
+| `GetEntriesJson()` | `[]string` | Each log entry as a JSON object |
+| `GetTotalCount()` | `int32` | Total matching entries |
+| `GetError()` | `string` | Non-empty if the query failed |
 
 ---
 
