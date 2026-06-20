@@ -63,19 +63,14 @@ func (p myPlugin) Execute(ctx context.Context, req *plugin.ExecuteRequest) (*plu
 }
 ```
 
-### Plugin output — `Output` vs `ResultJson`
+### Plugin output
 
-Plugins do not need to know their position in the pipeline. Follow one simple rule:
-
-- **Always set `Output`** with the typed result your plugin produces. The host uses this to pass
-  data to the next stage, or renders it as a standard stats/log table when your plugin is last.
-- **Optionally also set `ResultJson`** if your plugin has a dedicated frontend component that needs
-  a custom JSON shape. When set, `ResultJson` takes precedence over `Output` for terminal rendering,
-  but `Output` is still used when your plugin is not the last stage.
+Plugins always set `Output` with a typed `PipelineValue`. The host passes it to the next stage
+when the plugin is intermediate, or renders it as a stats/log table when it is the last stage.
+Plugins never need to know their position in the pipeline.
 
 ```go
 return &plugin.ExecuteResponse{
-    // Always set — lets this plugin be used at any position in the pipeline.
     Output: &plugin.PipelineValue{
         Value: &plugin.PipelineValue_Stats{
             Stats: &plugin.StatsResult{
@@ -84,14 +79,22 @@ return &plugin.ExecuteResponse{
             },
         },
     },
-    // Optional — only needed when your frontend component expects a custom shape.
-    ResultJson: customJSON,
 }, nil
 ```
 
-If a plugin sets only `ResultJson` and is used as a non-terminal stage, the host returns an error
-to the user ("this plugin cannot be used as an intermediate stage"). The plugin author does not need
-to handle this case.
+If your plugin annotates the result for a specific frontend rendering (e.g. a chart type), set the
+relevant field on the typed value:
+
+```go
+Stats: &plugin.StatsResult{
+    Columns:   columns,
+    RowsJson:  rowsJSON,
+    ChartType: "pie",   // frontend renders as a pie chart
+},
+```
+
+If a plugin sets no `Output` and is used as a non-terminal stage, the host returns a clear error
+to the user. The plugin author does not need to handle this case.
 
 ---
 
@@ -161,11 +164,8 @@ Called when a query contains one of your registered pipe keywords.
 
 | Field | Type | Description |
 |---|---|---|
-| `ResultJson` | `[]byte` | JSON rendered by the frontend component (terminal stage) |
-| `Output` | `*PipelineValue` | Typed value passed to the next stage (non-terminal stage) |
+| `Output` | `*PipelineValue` | Typed result — passed forward or rendered by the host |
 | `Error` | `string` | Non-empty aborts the pipeline and shows an error to the user |
-
-Set either `ResultJson` or `Output`, not both. Non-terminal stages must set `Output`.
 
 ---
 
@@ -190,6 +190,7 @@ The typed value that flows between pipe stages.
 | `GetRowsJson()` | `[]string` | Each row as a JSON array, e.g. `["host1", 42]` |
 | `GetIsAggregate()` | `bool` | True when the expression produced aggregated results |
 | `GetTotalCount()` | `int32` | Total rows across all pages |
+| `GetChartType()` | `string` | Optional rendering hint, e.g. `"pie"`, `"bar"`, `"line"` |
 
 **`LogResult`** fields (via getters):
 
