@@ -106,6 +106,8 @@ type StatsResult struct {
 	RowsJson    []string `protobuf:"bytes,3,rep,name=rows_json,json=rowsJson,proto3" json:"rows_json,omitempty"`
 	IsAggregate bool     `protobuf:"varint,4,opt,name=is_aggregate,json=isAggregate,proto3" json:"is_aggregate,omitempty"`
 	TotalCount  int32    `protobuf:"varint,5,opt,name=total_count,json=totalCount,proto3" json:"total_count,omitempty"`
+	// Optional rendering hint set by a downstream plugin, e.g. "pie", "bar", "line".
+	ChartType string `protobuf:"bytes,6,opt,name=chart_type,json=chartType,proto3" json:"chart_type,omitempty"`
 }
 
 func (x *StatsResult) ProtoReflect() protoreflect.Message {
@@ -145,6 +147,13 @@ func (x *StatsResult) GetTotalCount() int32 {
 		return x.TotalCount
 	}
 	return 0
+}
+
+func (x *StatsResult) GetChartType() string {
+	if x != nil {
+		return x.ChartType
+	}
+	return ""
 }
 
 // The typed value that flows between pipe stages.
@@ -302,23 +311,13 @@ type ExecuteResponse struct {
 	sizeCache     protoimpl.SizeCache
 	unknownFields protoimpl.UnknownFields
 
-	// JSON object sent to the frontend for rendering (terminal stages).
-	ResultJson []byte `protobuf:"bytes,1,opt,name=result_json,json=resultJson,proto3" json:"result_json,omitempty"`
-	Error      string `protobuf:"bytes,2,opt,name=error,proto3" json:"error,omitempty"`
-	// Typed output for non-terminal stages. When set, the host passes this as
-	// the input to the next stage instead of rendering result_json.
-	Output *PipelineValue `protobuf:"bytes,3,opt,name=output,proto3" json:"output,omitempty"`
+	Error string `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
+	// Typed output passed to the next stage, or rendered by the host when terminal.
+	Output *PipelineValue `protobuf:"bytes,2,opt,name=output,proto3" json:"output,omitempty"`
 }
 
 func (x *ExecuteResponse) ProtoReflect() protoreflect.Message {
 	panic(`not implemented`)
-}
-
-func (x *ExecuteResponse) GetResultJson() []byte {
-	if x != nil {
-		return x.ResultJson
-	}
-	return nil
 }
 
 func (x *ExecuteResponse) GetError() string {
