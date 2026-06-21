@@ -132,7 +132,8 @@ type PipePlugin interface {
 
 #### `GetInfo`
 
-Called by the host at startup to discover the plugin's name and the pipe commands it handles.
+Called by the host at startup to discover the plugin's name, pipe commands, and any
+configuration variables it exposes to the user.
 
 **Returns** `*InfoResponse`:
 
@@ -141,6 +142,7 @@ Called by the host at startup to discover the plugin's name and the pipe command
 | `Name` | `string` | Human-readable plugin name |
 | `Version` | `string` | Plugin version string |
 | `Commands` | `[]string` | Pipe keywords this plugin handles (e.g. `["chart"]`) |
+| `ConfigVars` | `[]*ConfigVar` | User-configurable settings (see [Plugin configuration](#plugin-configuration)) |
 
 #### `Execute`
 
@@ -159,6 +161,7 @@ Called when a query contains one of your registered pipe keywords.
 | `GetPage()` | `int32` | Requested page number (1-based) |
 | `GetPageSize()` | `int32` | Requested page size |
 | `GetInput()` | `*PipelineValue` | Output of the previous stage, or `nil` if this is stage 1 |
+| `GetConfig()` | `map[string]string` | User-supplied config values, keyed by `ConfigVar.Name` |
 
 **Returns** `*ExecuteResponse`:
 
@@ -254,6 +257,108 @@ type PipeHost interface {
 | `GetEntriesJson()` | `[]string` | Each log entry as a JSON object |
 | `GetTotalCount()` | `int32` | Total matching entries |
 | `GetError()` | `string` | Non-empty if the query failed |
+
+---
+
+## Plugin configuration
+
+Plugins can declare configuration variables that the Sieve host exposes to the user through a
+settings UI. Values are persisted in `plugins/<name>/config.json` alongside the plugin and are
+passed to every `Execute` call via `req.GetConfig()`.
+
+### Declaring config variables
+
+Return `ConfigVars` from `GetInfo`:
+
+```go
+func (p myPlugin) GetInfo(_ context.Context, _ *plugin.InfoRequest) (*plugin.InfoResponse, error) {
+    return &plugin.InfoResponse{
+        Name:     "my-plugin",
+        Version:  "1.0.0",
+        Commands: []string{"mycommand"},
+        ConfigVars: []*plugin.ConfigVar{
+            {
+                Name:        "api_endpoint",
+                Type:        "string",
+                Description: "Base URL of the external API",
+                DefaultValue: "https://api.example.com",
+            },
+            {
+                Name:        "max_results",
+                Type:        "number",
+                Description: "Maximum number of results to return",
+                DefaultValue: "100",
+            },
+            {
+                Name:        "verbose",
+                Type:        "bool",
+                Description: "Log detailed output",
+                DefaultValue: "false",
+            },
+            {
+                Name:        "api_key",
+                Type:        "string",
+                Description: "API key for authentication",
+                Secret:      true,  // stored encrypted, masked in the UI
+            },
+        },
+    }, nil
+}
+```
+
+**`ConfigVar` fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `Name` | `string` | Key used in `req.GetConfig()` |
+| `Type` | `string` | `"string"`, `"number"`, or `"bool"` — controls the input widget in the UI |
+| `Description` | `string` | Label shown next to the input |
+| `DefaultValue` | `string` | Value used when the user hasn't saved anything |
+| `Secret` | `bool` | When `true`, the value is stored encrypted and never shown in the UI |
+
+### Reading config in Execute
+
+```go
+func (p myPlugin) Execute(ctx context.Context, req *plugin.ExecuteRequest) (*plugin.ExecuteResponse, error) {
+    cfg := req.GetConfig()
+
+    endpoint := cfg["api_endpoint"]
+    if endpoint == "" {
+        endpoint = "https://api.example.com"  // fall back to default
+    }
+
+    apiKey := cfg["api_key"]  // decrypted by the host before delivery
+    if apiKey == "" {
+        return &plugin.ExecuteResponse{Error: "api_key is required — configure it in Settings → Plugins"}, nil
+    }
+
+    maxResults := 100
+    if v := cfg["max_results"]; v != "" {
+        if n, err := strconv.Atoi(v); err == nil {
+            maxResults = n
+        }
+    }
+
+    // ... use endpoint, apiKey, maxResults
+}
+```
+
+### Config storage and secrets
+
+Config is stored in `plugins/<name>/config.json` next to the plugin directory. Non-secret values
+are stored as plain text and can be copied between machines freely. Secret values are encrypted
+with AES-256-GCM using a machine-specific key (`plugins/.config-key`).
+
+Because the encryption key is machine-specific, secret values do not transfer when copying a
+config file to another machine — the user must re-enter them. Non-secret values transfer without
+any extra steps.
+
+To use a shared key across machines (e.g. in a team deployment), set the `SIEVE_CONFIG_KEY`
+environment variable to a hex-encoded 32-byte key:
+
+```bash
+export SIEVE_CONFIG_KEY=$(openssl rand -hex 32)
+```
 
 ---
 
